@@ -1,0 +1,615 @@
+# coding=utf-8
+#
+# Copyright 2022 Shandong University Fangkai Jiao
+#
+# Part of this code is based on the source code of Transformers
+# (arXiv:1910.03771)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import glob
+import json
+import logging
+import os
+import subprocess
+import sys
+from typing import Dict, Union
+
+import hydra
+import torch
+from fairscale.nn.data_parallel.fully_sharded_data_parallel import FullyShardedDataParallel as FullyShardedDDP
+from fairscale.optim.grad_scaler import ShardedGradScaler
+from omegaconf import DictConfig, OmegaConf
+from torch import distributed as dist
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler)
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm, trange
+from transformers import (get_linear_schedule_with_warmup, AutoTokenizer, PreTrainedTokenizer)
+
+from general_util.logger import setting_logger
+from general_util.training_utils import batch_to_device, unwrap_model, set_seed, note_best_checkpoint, initialize_optimizer, \
+    load_and_cache_examples, if_cancel_sync
+
+logger: logging.Logger
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def save_model(model: Union[torch.nn.Module, FullyShardedDDP], cfg: DictConfig, output_dir: str, tokenizer: PreTrainedTokenizer = None):
+    # Save model checkpoint.
+    if cfg.local_rank != -1:
+        state_dict = model.state_dict()
+        if cfg.local_rank == 0:
+            unwrap_model(model).save_pretrained(output_dir, state_dict=state_dict)
+    else:
+        model.save_pretrained(output_dir)
+
+    # Save tokenizer and training args.
+    if cfg.local_rank in [-1, 0]:
+        if tokenizer is not None:
+            tokenizer.save_pretrained(output_dir)
+        OmegaConf.save(cfg, os.path.join(output_dir, "training_config.yaml"))
+        logger.info("Saving model checkpoint to %s", output_dir)
+
+
+def forward_step(model, inputs: Dict[str, torch.Tensor], cfg, scaler, return_outputs: bool = False):
+    if cfg.fp16:
+        with torch.cuda.amp.autocast(dtype=(torch.bfloat16 if getattr(cfg, "fp16_bfloat16", False) else torch.float16)):
+            outputs = model(**inputs)
+    else:
+        outputs = model(**inputs)
+
+    if isinstance(outputs, tuple):
+        loss = outputs[0]
+    else:
+        loss = outputs["loss"]
+
+    if cfg.n_gpu > 1:
+        loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+    if cfg.gradient_accumulation_steps > 1:
+        loss = loss / cfg.gradient_accumulation_steps
+
+    if cfg.fp16:
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
+
+    if return_outputs:
+        return loss.item(), outputs
+
+    return loss.item()
+
+
+def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
+    """ Train the model """
+    if cfg.local_rank in [-1, 0]:
+        _dir_splits = cfg.output_dir.split('/')
+        _log_dir = '/'.join([_dir_splits[0], 'runs'] + _dir_splits[1:])
+        tb_writer = SummaryWriter(log_dir=_log_dir)
+        tb_helper = hydra.utils.instantiate(cfg.summary_helper,
+                                            writer=tb_writer) if "summary_helper" in cfg and cfg.summary_helper else None
+    else:
+        tb_writer = None
+        tb_helper = None
+
+    # cfg.train_batch_size = cfg.per_gpu_train_batch_size * max(1, cfg.n_gpu)
+    cfg.train_batch_size = cfg.per_gpu_train_batch_size
+    train_sampler = RandomSampler(train_dataset) if cfg.local_rank == -1 else DistributedSampler(train_dataset)
+    train_collator = hydra.utils.instantiate(cfg.collator) if "collator" in cfg and cfg.collator else None
+    train_dataloader = DataLoader(dataset=train_dataset,
+                                  sampler=train_sampler,
+                                  batch_size=cfg.train_batch_size,
+                                  collate_fn=train_collator,
+                                  num_workers=cfg.num_workers,
+                                  pin_memory=True,
+                                  prefetch_factor=cfg.prefetch_factor)
+
+    if "extended_vocab" in cfg and cfg.extended_vocab:
+        logger.info(f"Extended extra vocab size: {cfg.extended_vocab}")
+        model.resize_token_embeddings(model.config.vocab_size + cfg.extended_vocab)
+
+    if "with_lightseq" in cfg and cfg.with_lightseq:
+        logger.info(f"Enabling Lightseq.")
+
+        from general_util.lightseq_utils import inject_ls_roberta_enc_layer
+
+        inject_ls_roberta_enc_layer(model, cfg, model.config)
+
+    if cfg.max_steps > 0:
+        t_total = cfg.max_steps
+        cfg.num_train_epochs = cfg.max_steps // (len(train_dataloader) // cfg.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(train_dataloader) // cfg.gradient_accumulation_steps * cfg.num_train_epochs
+
+    num_warmup_steps = int(t_total * cfg.warmup_proportion) if cfg.warmup_proportion else cfg.warmup_steps
+
+    optimizer = scheduler = None
+    # Prepare optimizer and schedule (linear warmup and decay)
+    if cfg.local_rank == -1:
+        optimizer = initialize_optimizer(cfg, model=model)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=t_total)
+
+    if cfg.fp16:
+        if cfg.local_rank != -1:
+            scaler = ShardedGradScaler()
+        else:
+            from torch.cuda.amp.grad_scaler import GradScaler
+
+            scaler = GradScaler()
+    else:
+        scaler = None
+
+    # Distributed training (should be after apex fp16 initialization)
+    if cfg.local_rank != -1:
+        model = hydra.utils.instantiate(cfg.fairscale_config, model=model, device=cfg.device)
+        optimizer = initialize_optimizer(cfg, model=model)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=t_total)
+
+    logger.info(optimizer)
+
+    # Train!
+    logger.info("***** Running training *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", cfg.num_train_epochs)
+    logger.info("  Instantaneous batch size per GPU = %d", cfg.per_gpu_train_batch_size)
+    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                cfg.train_batch_size * cfg.gradient_accumulation_steps * (dist.get_world_size() if cfg.local_rank != -1 else 1))
+    logger.info("  Gradient Accumulation steps = %d", cfg.gradient_accumulation_steps)
+    logger.info("  Total optimization steps = %d", t_total)
+    logger.info("  Warmup steps = %d", num_warmup_steps)
+
+    if continue_from_global_step > 0:
+        logger.info("Fast forwarding to global step %d to resume training from latest checkpoint...", continue_from_global_step)
+
+    global_step = 0
+    tr_loss, logging_loss = 0.0, 0.0
+    model.zero_grad()
+    train_iterator = trange(int(cfg.num_train_epochs), desc="Epoch", disable=cfg.local_rank not in [-1, 0])
+    set_seed(cfg)  # Added here for reproducibility (even between python 2 and 3)
+
+    for epoch in train_iterator:
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=cfg.local_rank not in [-1, 0], dynamic_ncols=True)
+        if cfg.local_rank != -1:
+            train_dataloader.sampler.set_epoch(epoch)
+
+        for step, batch in enumerate(epoch_iterator):
+            # If training is continued from a checkpoint, fast forward
+            # to the state of that checkpoint.
+            if global_step < continue_from_global_step:
+                if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                    scheduler.step()  # Update learning rate schedule
+                    global_step += 1
+                continue
+
+            model.train()
+            batch = batch_to_device(batch, cfg.device)
+
+            last_outputs = None
+            if if_cancel_sync(cfg, step):
+                # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                with model.no_sync():
+                    loss = forward_step(model, batch, cfg, scaler)
+            else:
+                loss, last_outputs = forward_step(model, batch, cfg, scaler, return_outputs=True)
+
+            tr_loss += loss
+            if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                if cfg.fp16:
+                    scaler.unscale_(optimizer)
+
+                if cfg.max_grad_norm and not ("optimizer" in cfg and cfg.optimizer and "lamb" in cfg.optimizer):
+                    if hasattr(optimizer, "clip_grad_norm"):
+                        optimizer.clip_grad_norm(cfg.max_grad_norm)
+                    elif hasattr(model, "clip_grad_norm_"):
+                        model.clip_grad_norm_(cfg.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+
+                if cfg.fp16:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()  # Update learning rate schedule
+                model.zero_grad(set_to_none=True)
+                global_step += 1
+
+                # Log metrics
+                if cfg.local_rank in [-1, 0] and cfg.logging_steps > 0 and global_step % cfg.logging_steps == 0:
+                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    tb_writer.add_scalar('loss', (tr_loss - logging_loss) / cfg.logging_steps, global_step)
+                    logging_loss = tr_loss
+
+                    if tb_helper:
+                        tb_helper(step=global_step, last_batch=batch, last_outputs=last_outputs)
+
+                # Save model checkpoint
+                if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
+                    output_dir = os.path.join(cfg.output_dir, 'checkpoint-{}'.format(global_step))
+                    if cfg.local_rank in [-1, 0] and not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    save_model(model, cfg, output_dir, tokenizer)
+
+                # Evaluation
+                if cfg.evaluate_during_training and cfg.eval_steps > 0 and global_step % cfg.eval_steps == 0:
+                    state_dict = model.state_dict()
+
+                    if cfg.ddp_eval or cfg.local_rank in [-1, 0]:
+                        results = evaluate(cfg, model, tokenizer, prefix=str(global_step), _split="dev")
+
+                        if cfg.local_rank in [-1, 0]:
+                            for key, value in results.items():
+                                tb_writer.add_scalar(f"eval/{key}", value, global_step)
+
+                            sub_path = os.path.join(cfg.output_dir, 'checkpoint-{}'.format(global_step))
+                            flag = note_best_checkpoint(cfg, results, sub_path)
+                            if cfg.save_best and flag:
+                                if cfg.local_rank == 0:
+                                    unwrap_model(model).save_pretrained(cfg.output_dir, state_dict=state_dict)
+                                else:
+                                    model.save_pretrained(cfg.output_dir)
+
+                                tokenizer.save_pretrained(cfg.output_dir)
+                                OmegaConf.save(cfg, os.path.join(cfg.output_dir, "training_config.yaml"))
+                                logger.info("Saving best model checkpoint to %s", cfg.output_dir)
+
+                del batch
+                del last_outputs
+
+            if 0 < cfg.max_steps < global_step:
+                epoch_iterator.close()
+                break
+
+        if 0 < cfg.max_steps < global_step:
+            train_iterator.close()
+            break
+
+    if cfg.local_rank in [-1, 0]:
+        tb_writer.close()
+
+    return global_step, tr_loss / global_step
+
+
+def evaluate(cfg, model, tokenizer: PreTrainedTokenizer, prefix="", _split="dev"):
+
+    dataset = load_and_cache_examples(cfg, tokenizer, _split=_split)
+
+    if cfg.local_rank in [-1, 0] and not os.path.exists(os.path.join(cfg.output_dir, prefix)):
+        os.makedirs(os.path.join(cfg.output_dir, prefix))
+
+    cfg.eval_batch_size = cfg.per_gpu_eval_batch_size
+    if cfg.ddp_eval and cfg.local_rank != -1:
+        eval_sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        eval_sampler = SequentialSampler(dataset)  # Note that DistributedSampler samples randomly
+
+    eval_collator = hydra.utils.instantiate(cfg.collator) if "collator" in cfg and cfg.collator else None
+    eval_dataloader = DataLoader(dataset,
+                                 sampler=eval_sampler,
+                                 batch_size=cfg.eval_batch_size,
+                                 collate_fn=eval_collator)
+
+    post_processor = hydra.utils.instantiate(cfg.post_process) if "post_process" in cfg and cfg.post_process else None
+
+    single_model_gpu = unwrap_model(model)
+    if hasattr(single_model_gpu, "get_eval_log"):
+        single_model_gpu.get_eval_log(reset=True)
+    # Eval!
+    torch.cuda.empty_cache()
+    logger.info("***** Running evaluation {}.{} *****".format(_split, prefix))
+    logger.info("  Num examples = %d", len(dataset))
+    logger.info("  Batch size = %d", cfg.eval_batch_size)
+    # Seems FSDP does not need to unwrap the model for evaluating.
+    model.eval()
+    pred_list = []
+    indices_list = []
+
+    torch.cuda.empty_cache()
+
+    prediction_state = _split == "test" and getattr(cfg, "generator", False)
+    for batch in tqdm(eval_dataloader, desc="Evaluating", disable=cfg.local_rank not in [-1, 0], dynamic_ncols=True):
+        if "meta_data" in batch:
+            meta_data = batch.pop("meta_data")
+        else:
+            meta_data = []
+        if "index" in batch:
+            indices_list.extend(batch.pop("index").tolist())
+
+        batch = batch_to_device(batch, cfg.device)
+        if cfg.fp16:
+            with torch.cuda.amp.autocast(dtype=(torch.bfloat16 if getattr(cfg, "fp16_bfloat16", False) else torch.float16)):
+                with torch.no_grad():
+                    if not prediction_state:
+                        outputs = model(**batch)
+                        probs = outputs["logits"].softmax(dim=-1).detach().float().cpu()
+
+                        _, pred = probs.max(dim=-1)
+                        pred_list.extend(pred.tolist())
+                    else:
+                        if "labels" in batch:
+                            batch.pop("labels")
+
+                        outputs = model(**batch, disable_decoder=True)
+
+                        # It seems that only beam search mode returns sequence scores.
+                        if getattr(cfg, "output_scores", False) and cfg.num_beams > 1:
+                            decoding_outputs = model.generate(**batch, max_length=cfg.max_output_length,
+                                                              num_beams=cfg.num_beams,
+                                                              num_return_sequences=cfg.num_return_sequences,
+                                                              output_scores=getattr(cfg, "output_scores", False),
+                                                              return_dict_in_generate=True)
+                            # print(decoding_outputs.__class__.__name__)
+                            # print(decoding_outputs)
+                            generated_seq = tokenizer.batch_decode(decoding_outputs["sequences"], skip_special_tokens=True)
+                            outputs["generated_seq"] = generated_seq
+                            outputs["sequences_scores"] = decoding_outputs["sequences_scores"]
+                        else:
+                            decoding_outputs = model.generate(**batch, max_length=cfg.max_output_length,
+                                                              num_beams=cfg.num_beams,
+                                                              num_return_sequences=cfg.num_return_sequences)
+                            decoding_outputs = tokenizer.batch_decode(decoding_outputs, skip_special_tokens=True)
+                            outputs["generated_seq"] = decoding_outputs
+        else:
+            with torch.no_grad():
+                if not prediction_state:
+                    outputs = model(**batch)
+                    probs = outputs["logits"].softmax(dim=-1).detach().float().cpu()
+
+                    _, pred = probs.max(dim=-1)
+                    pred_list.extend(pred.tolist())
+                else:
+                    if "labels" in batch:
+                        batch.pop("labels")
+
+                    outputs = model(**batch, disable_decoder=True)
+
+                    # It seems that only beam search mode returns sequence scores.
+                    if getattr(cfg, "output_scores", False) and cfg.num_beams > 1:
+                        decoding_outputs = model.generate(**batch, max_length=cfg.max_output_length,
+                                                          num_beams=cfg.num_beams,
+                                                          num_return_sequences=cfg.num_return_sequences,
+                                                          output_scores=getattr(cfg, "output_scores", False),
+                                                          return_dict_in_generate=True)
+                        generated_seq = tokenizer.batch_decode(decoding_outputs["sequences"], skip_special_tokens=True)
+                        outputs["generated_seq"] = generated_seq
+                        outputs["sequences_scores"] = decoding_outputs["sequences_scores"]
+                    else:
+                        decoding_outputs = model.generate(**batch, max_length=cfg.max_output_length,
+                                                          num_beams=cfg.num_beams,
+                                                          num_return_sequences=cfg.num_return_sequences)
+                        decoding_outputs = tokenizer.batch_decode(decoding_outputs, skip_special_tokens=True)
+                        outputs["generated_seq"] = decoding_outputs
+
+        if post_processor is not None:
+            if any(hasattr(post_processor, tmp) for tmp in ["gather", "gather_object"]):
+                kwargs = {
+                    "ddp": cfg.ddp_eval and cfg.local_rank != -1
+                }
+            else:
+                kwargs = {}
+            post_processor(meta_data, outputs, **kwargs)
+
+    if hasattr(single_model_gpu, "get_eval_log"):
+        metric_log, results = single_model_gpu.get_eval_log(reset=True, ddp=(cfg.ddp_eval and cfg.local_rank != -1),
+                                                            device=cfg.device)
+    else:
+        results = {}
+
+    if post_processor is not None:
+        post_results, post_predictions = post_processor.get_results()
+        results.update(post_results)
+        metric_log = '\t'.join([f"{k}: {v}" for k, v in results.items()])
+        predictions = post_predictions
+    else:
+        predictions = pred_list
+
+    logger.info("****** Evaluation Results ******")
+    logger.info(f"Global Steps: {prefix}")
+    logger.info(metric_log)
+
+    if cfg.local_rank == -1:
+        prediction_file = os.path.join(cfg.output_dir, prefix, "eval_predictions.json")
+    else:
+        prediction_file = os.path.join(cfg.output_dir, prefix, f"eval_predictions_rank{cfg.local_rank}.json")
+    json.dump(predictions, open(prediction_file, "w"), ensure_ascii=False, indent=2)
+
+    torch.cuda.empty_cache()
+
+    return results
+
+
+def setup_slurm_distributed(cfg: DictConfig, backend="nccl", port=None):
+    """
+    Most code are copied from https://github.com/BIGBALLON/distribuuuu/blob/master/tutorial/mnmc_ddp_slurm.py.
+    """
+    num_gpus = torch.cuda.device_count()
+    if num_gpus <= 1 or cfg.no_cuda:
+        cfg.local_rank = -1
+        cfg.device = str(torch.device("cuda" if torch.cuda.is_available() and not cfg.no_cuda else "cpu"))
+        cfg.n_gpu = min(num_gpus, 1)
+        cfg.ddp_eval = False
+        return
+
+    # Data Parallel or Model Parallel on multiple GPUs with single task.
+    if int(os.environ["SLURM_NTASKS"]) == 1:
+        cfg.n_gpu = num_gpus
+        cfg.ddp_eval = False
+        cfg.device = str(torch.device("cuda"))
+        cfg.local_rank = -1
+        return
+
+    proc_id = int(os.environ["SLURM_PROCID"])
+    n_tasks = int(os.environ["SLURM_NTASKS"])
+    node_list = os.environ["SLURM_NODELIST"]
+
+    torch.cuda.set_device(proc_id % num_gpus)
+
+    addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
+    # specify master port
+    if port is not None:
+        os.environ["MASTER_PORT"] = str(port)
+    elif "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = addr
+
+    os.environ["WORLD_SIZE"] = str(n_tasks)
+    os.environ["LOCAL_RANK"] = str(proc_id % num_gpus)
+    os.environ["RANK"] = str(proc_id)
+
+    cfg.n_gpu = int(num_gpus / n_tasks)  # For distributed model parallel.
+    cfg.local_rank = int(os.environ["LOCAL_RANK"])
+    # cfg.local_rank = int(os.environ["RANK"])
+    cfg.world_size = int(os.environ["WORLD_SIZE"])
+    cfg.device = str(torch.device("cuda", cfg.local_rank))
+
+    dist.init_process_group(backend=backend, world_size=int(os.environ["WORLD_SIZE"]), rank=int(os.environ["RANK"]))
+
+    # print(cfg.n_gpu, cfg.local_rank, cfg.world_size, cfg.device)
+    # print(cfg.local_rank)
+    cfg.local_rank = dist.get_rank()
+    # print(cfg.local_rank)
+
+
+@hydra.main(version_base="1.2", config_path="conf/mt5/xl", config_name="cls_table_dpr_en_col_en_gd_v4_0_slurm")
+def main(cfg: DictConfig):
+    setup_slurm_distributed(cfg)
+
+    global logger
+    logger = setting_logger(cfg.output_dir, local_rank=cfg.local_rank)
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+                   cfg.local_rank, cfg.device, cfg.n_gpu, bool(cfg.local_rank != -1), cfg.fp16)
+
+    # Set seed
+    set_seed(cfg)
+
+    # Load pre-trained model and tokenizer
+    if cfg.local_rank not in [-1, 0]:
+        dist.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    if cfg.pretrain:
+        pretrain_state_dict = torch.load(cfg.pretrain, map_location='cpu')
+    else:
+        pretrain_state_dict = None
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path, use_fast=False)
+    # model = hydra.utils.call(cfg.model, cfg.model_name_or_path, state_dict=pretrain_state_dict)
+    try:
+        model = hydra.utils.call(cfg.model, cfg.model_name_or_path, state_dict=pretrain_state_dict)
+    except Exception as e:
+        logger.warning(e)
+        model = hydra.utils.call(cfg.model)
+
+    if cfg.local_rank == 0:
+        dist.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    if cfg.local_rank == -1:  # For FullyShardedDDP, place the model on cpu first.
+        if cfg.n_gpu in [0, 1]:
+            model.to(cfg.device)
+        else:
+            # For model parallel (of mT5)
+            logger.info(f"Model Parallel initialization.")
+            model.parallelize(hydra.utils.call(cfg.get_device_map))
+
+    # logger.info("Training/evaluation parameters %s", OmegaConf.to_yaml(cfg))
+    if cfg.local_rank in [-1, 0] and cfg.do_train:
+        if not os.path.exists(cfg.output_dir):
+            os.makedirs(cfg.output_dir)
+        OmegaConf.save(cfg, os.path.join(cfg.output_dir, "training_config.yaml"))
+
+    # Training
+    if cfg.do_train:
+        # TODO: Add option for continuously training from checkpoint.
+        #  The operation should be introduced in ``train`` method since both the state dict
+        #  of schedule and optimizer (and scaler, if any) should be loaded.
+        # If output files already exists, assume to continue training from latest checkpoint (unless overwrite_output_dir is set)
+        continue_from_global_step = 0  # If set to 0, start training from the beginning
+        # if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
+        #     checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/*/' + WEIGHTS_NAME, recursive=True)))
+        #     if len(checkpoints) > 0:
+        #         checkpoint = checkpoints[-1]
+        #         logger.info("Resuming training from the latest checkpoint: %s", checkpoint)
+        #         continue_from_global_step = int(checkpoint.split('-')[-1])
+        #         model = model_class.from_pretrained(checkpoint)
+        #         model.to(args.device)
+
+        train_dataset = load_and_cache_examples(cfg, tokenizer, _split="train")
+
+        if getattr(cfg, "do_preprocess", False):
+            exit(0)
+
+        global_step, tr_loss = train(cfg, train_dataset, model, tokenizer, continue_from_global_step)
+        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+
+    # Test
+    results = {}
+    if cfg.do_eval:
+        if not cfg.ddp_eval and cfg.local_rank not in [-1, 0]:
+            return results
+
+        # if cfg.local_rank == 0:
+        #     cfg.ddp_eval = False  # Canceling distributed evaluation since other progresses have already existed.
+        #     cfg.local_rank = -1
+        checkpoints = [cfg.output_dir]
+        if cfg.save_best:
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        elif cfg.prediction_cfg.best_checkpoint and os.path.exists(cfg.prediction_cfg.best_checkpoint):
+            checkpoints = [cfg.prediction_cfg.best_checkpoint]
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        elif cfg.eval_sub_path:
+            checkpoints = list(
+                os.path.dirname(c) for c in
+                sorted(glob.glob(cfg.output_dir + f"/{cfg.eval_sub_path}/" + "pytorch_model.bin", recursive=True))
+            )
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        logger.info(" the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
+            prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
+            split = "dev"
+
+            # model = hydra.utils.call(cfg.model, checkpoint)
+            if "model_eval" in cfg:
+                model = hydra.utils.call(cfg.model_eval, checkpoint)
+            else:
+                model = hydra.utils.call(cfg.model, checkpoint)
+            if cfg.n_gpu == 1:
+                model.to(cfg.device)
+            else:
+                # For model parallel (of mT5)
+                model.parallelize(hydra.utils.call(cfg.get_device_map))
+
+            if cfg.test_file:
+                prefix = f'test' + (f'-{prefix}' if prefix != "" else "")
+                split = "test"
+
+            result = evaluate(cfg, model, tokenizer, prefix=prefix, _split=split)
+            result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
+            results.update(result)
+
+    return results
+
+
+if __name__ == "__main__":
+    hydra_formatted_args = []
+    # convert the cli params added by torch.distributed.launch into Hydra format
+    for arg in sys.argv:
+        if arg.startswith("--"):
+            hydra_formatted_args.append(arg[len("--"):])
+        else:
+            hydra_formatted_args.append(arg)
+    sys.argv = hydra_formatted_args
+
+    main()

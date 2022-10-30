@@ -1,0 +1,179 @@
+hydra:
+  run:
+    dir: ./
+
+train_file: ../ccks2022/ccks_nl2sql/train.json
+dev_file: ../ccks2022/ccks_nl2sql/dev_gold.json
+test_file: ../ccks2022/ccks_nl2sql/test.json
+
+
+# Model
+model:
+  _target_: models.mt5.MT5ForSeq2SeqAndSeqClassificationGroundingV2.from_pretrained
+  num_labels: 3
+  tokenizer: ${model_name_or_path}
+
+# Fixed mask bug in generating labels, and add value-column matching loss.
+
+# Data loading
+read_tensor_train:
+  _target_: data.multi_task_grounding.read_data_w_multi_ground_v2
+  db_info_path: ../ccks2022/ccks_nl2sql/db_info.json
+  dpr_results_path: experiments/nl2sql.roberta.base.retrieve.v2.0.w1.A100.s42/test/eval_predictions_train.json
+  top_k_tab: 5
+  top_k_col: all
+  add_tab_cn: False
+  name_lowercase: True
+  max_input_length: 768
+  max_output_length: 256
+
+read_tensor_dev:
+  _target_: data.multi_task_grounding.read_data_w_multi_ground_v2
+  db_info_path: ../ccks2022/ccks_nl2sql/db_info.json
+  dpr_results_path: experiments/nl2sql.roberta.base.retrieve.v2.0.w1.A100.s42/test/eval_predictions_dev_gold.json
+  top_k_tab: 5
+  top_k_col: all
+  add_tab_cn: False
+  name_lowercase: True
+  max_input_length: 768
+  max_output_length: 256
+
+read_tensor_test:
+  _target_: data.multi_task_grounding.read_data_w_multi_ground_v2
+  db_info_path: ../ccks2022/ccks_nl2sql/db_info.json
+  dpr_results_path: experiments/nl2sql.roberta.base.retrieve.v2.0.w1.A100.s42/test/eval_predictions_test.json
+  top_k_tab: 5
+  top_k_col: all
+  add_tab_cn: False
+  name_lowercase: True
+  max_input_length: 768
+  max_output_length: 256
+
+extended_vocab: 2
+
+# Data collator
+collator:
+  _target_: data.collators.MetaCollator
+
+# Dataloader
+num_workers: 4
+prefetch_factor: 2
+
+# Wiki path pretrain v8.2
+model_name_or_path: ../pretrained-models/mt5-xl
+pretrain:
+get_device_map:
+  _target_: models.mt5.get_device_map
+
+output_dir: experiments/nl2sql.mt5.xl.w_cls.table_name_dpr_en.top${read_tensor_train.top_k_tab}.col_en.top${read_tensor_train.top_k_col}.gd.v2.0.full.w1.3090.s${seed}
+
+
+do_train: False
+evaluate_during_training: True
+
+do_eval: True
+eval_sub_path:
+
+# Training hyper-parameters
+per_gpu_train_batch_size: 2
+per_gpu_eval_batch_size: 1
+learning_rate: 1e-4
+gradient_accumulation_steps: 4
+weight_decay: 0.01
+adam_epsilon: 1e-6
+adam_betas: "(0.9, 0.999)"
+max_grad_norm: 0.0
+num_train_epochs: 50
+max_steps: 0
+warmup_proportion: 0.1
+warmup_steps: 0
+
+optimizer: "adafactor"
+
+logging_steps: 5
+save_steps: -1
+save_best: True
+ddp_eval: False
+eval_steps: 2000
+no_cuda: False
+seed: 42
+local_rank: -1
+fp16: True
+fp16_opt_level: O1
+fp16_bfloat16: True
+
+# Prediction config
+prediction_cfg:
+  metric: "cls_em"
+  measure: 1
+  best_checkpoint:
+  best_result:
+
+generator: True
+max_output_length: 128
+num_beams: 10
+num_return_sequences: 1
+output_scores: True
+post_process:
+#  _target_: general_util.metrics.SQLResultsWCls
+  _target_: general_util.metrics.SQLResultsWClsHelper
+  official_evaluate: True
+
+# fairscale.FullyShardedDP
+fairscale_config:
+  _target_: general_util.fsdp_utils.default_initialize
+  fp16: ${fp16}
+  reshard_after_forward: False
+  move_grads_to_cpu: False
+  move_params_to_cpu: False
+
+# Deepspeed config
+ds_cfg:
+  train_micro_batch_size_per_gpu: ${per_gpu_train_batch_size}
+  gradient_accumulation_steps: ${gradient_accumulation_steps}
+  optimizer:
+    type: AdamW
+    params:
+      lr: ${learning_rate}
+      betas: [0.9, 0.999]
+      eps: ${adam_epsilon}
+      weight_decay: ${weight_decay}
+  scheduler:
+    type: WarmupDecayLR
+    params:
+      total_num_steps:
+      warmup_max_lr: ${learning_rate}
+      warmup_num_steps:
+      warmup_type: linear
+  gradient_clipping: ${max_grad_norm}
+  fp16:
+    enabled: ${fp16}
+    initial_scale_power: 12
+  zero_optimization:
+    stage: 3
+#    offload_optimizer:
+#      device: cpu
+#      pin_memory: True
+#    offload_param:
+#      device: cpu
+#      pin_memory: True
+#  activation_checkpointing:
+#    partition_activations: True
+#    cpu_checkpointing: True
+#    contiguous_memory_optimization: False
+#    number_checkpoints: False
+#    synchronize_checkpoint_boundary: False
+#    profile: False
+  steps_per_print: 1024
+
+summary_helper:
+  _target_: general_util.tensorboard_helper.SummaryWriterHelper
+  batch_index_or_keys:
+  outputs_index_or_keys:
+
+# Temporary variables
+n_gpu:
+device:
+train_batch_size:
+eval_batch_size:
+world_size:

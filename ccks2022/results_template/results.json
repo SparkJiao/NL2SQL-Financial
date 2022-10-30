@@ -1,0 +1,113 @@
+[
+  {
+    "q_id": 0,
+    "question": "显示指标周期为\"一个月\"的基金收益为正的基金数目，按基金类别分组展示",
+    "db_name": "ccks_fund",
+    "sql_query": "select fundtypename, count(*) from mf_fundreturnrank where indexcycle = '一个月' and fundreturn > 0 group by fundtypename",
+    "from": {
+      "table_units": [
+        "mf_fundreturnrank"
+      ],
+      "conds": []
+    },
+    "select": [
+      false,
+      [
+        null,
+        null,
+        "fundtypename",
+        false
+      ],
+      [
+        "count",
+        null,
+        "*",
+        false
+      ]
+    ],
+    "where": [
+      [
+        [
+          null,
+          "indexcycle",
+          "=",
+          "'一个月'",
+          null
+        ]
+      ],
+      "and",
+      [
+        [
+          null,
+          "fundreturn",
+          ">",
+          "0",
+          null
+        ]
+      ]
+    ],
+    "groupBy": [
+      [
+        null,
+        "fundtypename"
+      ]
+    ],
+    "having": [],
+    "orderBy": [],
+    "limit": null
+  },
+  {
+    "q_id": 1,
+    "question": "列出本周以来基金基准增长幅度为正的基金和投资方向 谢谢啊",
+    "db_name": "ccks_fund",
+    "sql_query": "select b.secuabbr,b.investorientation from mf_benchmarkgrowthrate as a join mf_fundarchives as b on a.innercode=b.innercode   where a.benchgrforthisweek>0;",
+    "from": {
+      "table_units": [
+        "mf_benchmarkgrowthrate",
+        "mf_fundarchives"
+      ],
+      "conds": [
+        [
+          [
+            "mf_benchmarkgrowthrate",
+            "innercode"
+          ],
+          [
+            "mf_fundarchives",
+            "innercode"
+          ]
+        ]
+      ]
+    },
+    "select": [
+      false,
+      [
+        null,
+        "mf_fundarchives",
+        "secuabbr",
+        false
+      ],
+      [
+        null,
+        "mf_fundarchives",
+        "investorientation",
+        false
+      ]
+    ],
+    "where": [
+      [
+        [
+          "mf_benchmarkgrowthrate",
+          "benchgrforthisweek",
+          ">",
+          "0",
+          null
+        ]
+      ]
+    ],
+    "groupBy": [],
+    "having": [],
+    "orderBy": [],
+    "limit": null
+  }
+]
